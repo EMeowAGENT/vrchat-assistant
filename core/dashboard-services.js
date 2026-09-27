@@ -509,11 +509,7 @@ export function registerDashboardServices(loader, ctx) {
         statusDescription: user.statusDescription || content.statusDescription || '',
         previousStatus: content.previousStatus || '',
         previousStatusDescription: content.previousStatusDescription || '',
-        // 2026-09-27：模型名只采信可信值 —— VRChat 有时把模型图当头像推，名字会是 file_xxx_blob / 文件名 ✗
-        avatarName: (() => {
-          const nm = content.avatarName || user.currentAvatarName || '';
-          return isPlausibleAvatarName(nm) ? nm : '';
-        })(),
+        avatarName: content.avatarName || user.currentAvatarName || '',
         previousAvatarName: isPlausibleAvatarName(content.previousAvatarName) ? content.previousAvatarName : '',
         // avatarId 富化：WS 推送不含 currentAvatar，从 planet_cache 的 imageUrl→avatarId 映射反查（_syncFriendAvatars 建立）
         avatarId: content.avatarId || user.currentAvatar || (() => {
@@ -697,6 +693,11 @@ export function registerDashboardServices(loader, ctx) {
       const trow = ctx.storage.query(`SELECT COUNT(*) AS c FROM events ${tw}`, tp);
       total = trow[0] ? trow[0].c : 0;
     } catch { total = 0; }
+    // 2026-09-27：模型名只采信可信值 —— 统一在出口过滤（挡掉 blob/文件名类脏值）
+    for (const ev of result) {
+      if (ev.avatarName && !isPlausibleAvatarName(ev.avatarName)) ev.avatarName = '';
+      if (ev.previousAvatarName && !isPlausibleAvatarName(ev.previousAvatarName)) ev.previousAvatarName = '';
+    }
     return { events: result, total };
   });
   loader.serviceOwners.set('dashboard.events', 'core');
