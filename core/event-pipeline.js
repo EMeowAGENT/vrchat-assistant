@@ -452,8 +452,19 @@ export class EventPipeline {
         }
         // tags 说是用户图标 ⇒ 即使旧判据认为它是模型图，也按用户图标记（反向纠偏）；
         // unknown ⇒ 沿用旧判据（解析器未注入 / 404 / 异常时行为完全不变）
-        const iconChanged = iconKind === 'icon' ? iconDiffers
-          : (iconKind === 'model' ? false : iconChangedLegacy);
+        // 🔴 2026-09-27 用户报障（生产 id 18104/18105 同一毫秒、同一文件 file_a2d7f291…）：
+        //   该文件 tags 含 icon ⇒ 解析器判「用户图标」，而同一推送的 currentAvatarImageUrl 也是它 ⇒
+        //   上一层已按模型变动产出一条 avatar，这里又补一条 user_icon ⇒ 动态流同时两行 ✗。
+        //   ⇒ 证据优先级：本次推送自带的模型图证据压过 tags 结论（不含已存基线：基线可能本身就被误存）✓
+        const modelFileIdsNow = [
+          avatarFileId(newAvatarUrl || ''),
+          avatarFileId(userObj.currentAvatarImageUrl || ''),
+          avatarFileId(userObj.currentAvatarThumbnailImageUrl || ''),
+        ].filter(Boolean);
+        const iconIsModelImageNow = !!iconFileId && modelFileIdsNow.includes(iconFileId);
+        const iconChanged = iconIsModelImageNow ? false
+          : (iconKind === 'icon' ? iconDiffers
+            : (iconKind === 'model' ? false : iconChangedLegacy));
         if (iconChanged) {
           changes.push({ type: 'user_icon', payload: { userIcon: newUserIcon, previousUserIcon: prev.user_icon || '' } });
         }
