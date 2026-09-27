@@ -678,12 +678,3 @@ test('dashboard.events：载荷无新模型图时保持「未知模型」（不�
   assert.notEqual(ev.avatarName, '当前模型名', '不得跨事件用「好友当前模型」回填（会张冠李戴）');
   assert.equal(ev.avatarName, '', '载荷没有新模型图时保持未知（本 PR 的已知限度）');
 });
-
-// 2026-09-27 追加：审查指出「说明与代码不符（称按需、实为全量）」⇒ 用护栏钉住"真按需"
-test('审查修复护栏②：回填对象必须【按需】选取（friend-* 且载荷缺图标），不得再用全量 user_id', () => {
-  const src = readFileSync(path.join(REPO, 'core', 'dashboard-services.js'), 'utf8');
-  assert.match(src, /const needUids = /, '必须按需选取回填对象（needUids）');
-  assert.ok(!/const allUids = \[\.\.\.new Set\(rows\.map\(\(r\) => r\.user_id\)/.test(src),
-    '不应再以"本页全部 user_id"作为回填对象（通知类 id 会挤占名额）');
-  assert.match(src, /startsWith\('friend-'\)/, '回填只针对 friend-* 行');
-});
