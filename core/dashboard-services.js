@@ -532,17 +532,14 @@ export function registerDashboardServices(loader, ctx) {
         previousAvatarImageUrl: imgProxy(content.previousAvatarImageUrl || ''),
         bio: content.bio || user.bio || '',
         previousBio: content.previousBio || '',
-        // 用户定案 B（2026-09-27）：该行没带图标时，取「该行时刻之前最近一次已知图标」（历史如实）
-        userIcon: imgProxy(content.userIcon || user.userIcon || user.iconUrl || content.iconUrl
-          || histIconAt(row.user_id, row.created_at) || ''),
+        userIcon: imgProxy(content.userIcon || user.userIcon || user.iconUrl || content.iconUrl || ''),
         // 2026-09-22 用户报障「为什么会有没头像的（散华ln 非好友）」——实测：该用户 status 事件的载荷里
         // `avatarImageUrl` **就是空串** ✗（WS 没带图），所以本块即使拼了 avatarUrl 也不会有图 ✓。
         // 正解：回退到「该 userId **最近一次带图的事件**」（数据就在 events 表里 ✓ 不需要发 API ✓），带进程内缓存 + 负缓存 ✓。
         // 2026-09-22 用户报障「为什么会有没头像的（散华ln 非好友，半天也不加载）」：
         // 本块（profile 变更）**此前没有 avatarUrl** ✗，而前端 playerAvatarOf 优先读 avatarUrl ⇒ 非好友行头像空白 ✓。
         // 数据其实就在事件载荷里（status 事件自带 avatarImageUrl ✓）—— 不是「没加载」，是没被拼进去 ✓。
-        avatarUrl: avatarOf(content.userIcon || user.userIcon || user.iconUrl || histIconAt(row.user_id, row.created_at),
-            row.avatarUrl || content.avatarImageUrl || user.currentAvatarImageUrl)
+        avatarUrl: avatarOf(row.userIcon || user.userIcon, row.avatarUrl || content.avatarImageUrl || user.currentAvatarImageUrl)
           || lastKnownAvatarUrl(row.user_id),
         previousUserIcon: content.previousUserIcon || '',
         pronouns: content.pronouns || user.pronouns || '',
@@ -693,8 +690,13 @@ export function registerDashboardServices(loader, ctx) {
       const trow = ctx.storage.query(`SELECT COUNT(*) AS c FROM events ${tw}`, tp);
       total = trow[0] ? trow[0].c : 0;
     } catch { total = 0; }
-    // 2026-09-27：模型名只采信可信值 —— 统一在出口过滤（挡掉 blob/文件名类脏值）
+    // 2026-09-27（用户定案）：左侧圆头像一律取「该行当时」的图 —— 出口统一回填；
+    //   并把不可信的模型名（blob / 文件名类脏值）一并清掉。统一放出口，避免改动散落影响无关上下文。
     for (const ev of result) {
+      if (!ev.userIcon) {
+        const hist = histIconAt(ev.userId, ev.createdAt);
+        if (hist) ev.userIcon = imgProxy(hist);
+      }
       if (ev.avatarName && !isPlausibleAvatarName(ev.avatarName)) ev.avatarName = '';
       if (ev.previousAvatarName && !isPlausibleAvatarName(ev.previousAvatarName)) ev.previousAvatarName = '';
     }
