@@ -456,6 +456,10 @@ export class EventPipeline {
         //   该文件 tags 含 icon ⇒ 解析器判「用户图标」，而同一推送的 currentAvatarImageUrl 也是它 ⇒
         //   上一层已按模型变动产出一条 avatar，这里又补一条 user_icon ⇒ 动态流同时两行 ✗。
         //   ⇒ 证据优先级：本次推送自带的模型图证据压过 tags 结论（不含已存基线：基线可能本身就被误存）✓
+        // ⚠️（审查 EMeowAGENT 第六轮）：`avatarBanner` 档下 `avatarImageUrlFromUser` 就是把 iconUrl 当模型图
+        //   ⇒ 这一档里「本次载荷的模型图证据」与 icon **同源** ⇒ `iconIsModelImageNow` 恒真，
+        //   效果等价于既有的「avatarBanner ⇒ 不产 user_icon」门禁（代价＝该档下真实的用户图标变更也不报，
+        //   该取舍见上方 #263 段注释：误报是用户明确报障，误漏无用户可见后果）。非 avatarBanner 档不受影响 ✓
         const modelFileIdsNow = [
           avatarFileId(newAvatarUrl || ''),
           avatarFileId(userObj.currentAvatarImageUrl || ''),
