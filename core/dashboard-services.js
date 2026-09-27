@@ -402,10 +402,10 @@ export function registerDashboardServices(loader, ctx) {
       }
       // ⚠️1/⚠️2：截断与失败都按聚合留痕一行（本仓禁静默降级）✓
       if (allUids.length > uids.length) {
-        console.log('[dashboard] 头像历史回填按上限 ' + HIST_CAP + ' 截断：' + (allUids.length - uids.length) + ' 位好友未回填（其行仍回落「当前图标」）');
+        log.info('头像历史回填按上限 ' + HIST_CAP + ' 截断：' + (allUids.length - uids.length) + ' 位好友未回填（其行仍回落「当前图标」）');
       }
       if (histFailed.n) {
-        console.log('[dashboard] 头像历史回填失败 ' + histFailed.n + ' 位好友（本次按「当前图标」回落）');
+        log.warn('头像历史回填失败 ' + histFailed.n + ' 位好友（本次按「当前图标」回落）');
       }
     }
     const histIconAt = (uid, t) => {
@@ -684,7 +684,10 @@ export function registerDashboardServices(loader, ctx) {
         for (const { ev, fileId, key } of pending) {
           try {
             const a = await ctx.rateLimiter.execute(() => ctx.api._request('GET', `/file/${fileId}`));
-            const nm = parseAvName(a && a.data && a.data.name);
+            // 🔴 审查 EMeowAGENT 实测：本赋值发生在 DTO 出口过滤【之后】（异步 await 让出口循环先跑完），
+            //   故出口那层罩不住它 ⇒ 透出侧必须用同一判据过滤，否则 blob 名仍会作为模型名透出 ✓
+            const nmRaw = parseAvName(a && a.data && a.data.name);
+            const nm = isPlausibleAvatarName(nmRaw) ? nmRaw : '';
             if (nm) { ev[key] = nm; saveAvName(fileId, nm); try { log.debug(`[模型名] 已解析 ${fileId.slice(0,20)}… → ${nm}`); } catch { /* 日志失败忽略 */ } }
             else { log.info(`[模型名] 解析不出，落负缓存 6h：${fileId.slice(0,20)}…`); saveAvMiss(fileId); }   // 降级决策必须留痕 ✓
           } catch (e) { log.warn('[模型名] 解析失败（保留空名，下次再试）：' + (e && e.message ? e.message : e)); }
@@ -703,6 +706,8 @@ export function registerDashboardServices(loader, ctx) {
       const trow = ctx.storage.query(`SELECT COUNT(*) AS c FROM events ${tw}`, tp);
       total = trow[0] ? trow[0].c : 0;
     } catch { total = 0; }
+    // 💡1（审查 EMeowAGENT）：本出口只回填 userIcon；avatarUrl 仍走「好友当前值」⇒ 同一行两字段可能指向不同图。
+    //   前端左侧圆头像取 userIcon 优先，故显示正确；此处按现状保留（要彻底统一需另开 PR 把 avatarUrl 纳入同口径）。
     // 2026-09-27（用户定案）：左侧圆头像一律取「该行当时」的图 —— 出口统一回填；
     //   并把不可信的模型名（blob / 文件名类脏值）一并清掉。统一放出口，避免改动散落影响无关上下文。
     for (const ev of result) {
