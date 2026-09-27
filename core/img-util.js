@@ -58,17 +58,6 @@ export const parseAvatarName = (n) => {
 
 export const avatarOf = (iconUrl, modelUrl) => avatarThumb(iconUrl) || avatarThumb(modelUrl);
 
-/** 模型名是否可信（2026-09-27）：parseAvatarName 对「非 Avatar - 命名」的输入会【原样返回】，
- *  于是 file_xxx_blob / 裸 UUID / 图片文件名会被当成模型名显示。展示与入缓存前都要过这一关。 */
-export const isPlausibleAvatarName = (nm) => {
-  const s = String(nm || '').trim();
-  if (!s) return false;
-  if (/^file_/i.test(s) || /_blob$/i.test(s)) return false;
-  if (/\.(png|jpe?g|gif|webp|bmp|tga)$/i.test(s)) return false;
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(s)) return false;   // 裸 UUID
-  return true;
-};
-
 /** 该 file 的元数据是否是【用户图标】（VRChat 给自设/上传图标打的 tag 含 icon）。判据来源：VRCX-Luo getAvatarName() ✓ */
 export const isUserIconFile = (data) => {
   const tags = Array.isArray(data && data.tags) ? data.tags : [];
