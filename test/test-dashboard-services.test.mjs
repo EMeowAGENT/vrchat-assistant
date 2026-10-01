@@ -5,7 +5,7 @@
  *   trackedNonFriends / trackedChanges（bio/status 前后值）/ stats / owner 归属
  * 自包含：临时 SQLite + 造数据，不依赖真实 VRChat 凭据。
  */
-import { rmSync } from 'node:fs';
+import { rmSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
@@ -677,4 +677,85 @@ test('dashboard.events：载荷无新模型图时保持「未知模型」（不�
   assert.ok(ev, '应能查到该事件');
   assert.notEqual(ev.avatarName, '当前模型名', '不得跨事件用「好友当前模型」回填（会张冠李戴）');
   assert.equal(ev.avatarName, '', '载荷没有新模型图时保持未知（本 PR 的已知限度）');
+});
+
+
+// ── 2026-09-27（用户定案 B）：左侧圆头像按「该行当时」的图标回填 ──
+// 背景：原先无载荷图标的行会回落到「好友当前图标」（friends 表实时值），于是同一列里
+//   「当时快照」与「当前值」混排 —— 用户截图：同一位好友几行头像不一样 ✗。
+// 定案：一律显示「那一行当时的图」（老行没有任何历史图标时才回落当前值）。
+test('events：无载荷图标的行必须回填「该行时刻之前最近的已知图标」，不得回落好友当前图标', async () => {
+  const U2 = 'usr_test-icon-0000-0000-0000-000000000002';
+  const LIVE = 'https://api.vrchat.cloud/api/1/image/file_aaaa1111-0000-0000-0000-00000000000a/2/256';
+  const HIST = 'https://api.vrchat.cloud/api/1/image/file_bbbb2222-0000-0000-0000-00000000000b/1/256';
+  const MODEL = 'https://api.vrchat.cloud/api/1/image/file_cccc3333-0000-0000-0000-00000000000c/1/256';
+  ctx.storage.upsertFriend({ userId: U2, displayName: '图标测试', userIcon: LIVE, avatarImageUrl: '', bio: '', status: 'active' });
+  // t1：上线行（载荷里带当时的图标）
+  ctx.storage.insertEvent({
+    type: 'friend-online', userId: U2, displayName: '图标测试',
+    contentJson: { userId: U2, platform: 'standalonewindows', location: 'private', user: { id: U2, iconUrl: HIST } },
+    worldId: '', worldName: '', createdAt: '2026-09-27T01:00:00.000Z', source: 'websocket',
+  });
+  // t2：换模型行（载荷不带图标）—— 它的左侧头像应取 t1 那个"当时的图标"
+  ctx.storage.insertEvent({
+    type: 'friend-update', userId: U2, displayName: '图标测试',
+    contentJson: { userId: U2, displayName: '图标测试', type: 'avatar', avatarName: '某模型', avatarImageUrl: MODEL },
+    worldId: '', worldName: '', createdAt: '2026-09-27T02:00:00.000Z', source: 'websocket',
+  });
+  const svc = loader.services.get('dashboard.events');
+  const res = await svc({ limit: 100 });
+  const evs = res.events || res || [];
+  const fidOf = (u) => avatarFileId(decodeURIComponent(String(u || '')));
+  const online = evs.find((e) => e.type === 'friend-online' && e.userId === U2);
+  const avatar = evs.find((e) => e.type === 'friend-update' && e.userId === U2 && e.updateType === 'avatar');
+  assert.ok(online && avatar, '两条事件都应在响应里（online + avatar）');
+  assert.equal(fidOf(online.userIcon), avatarFileId(HIST), '带载荷图标的行用载荷里那一刻的图标');
+  assert.equal(fidOf(avatar.userIcon), avatarFileId(HIST), '无载荷图标的行必须回填"当时最近的已知图标"');
+  assert.notEqual(fidOf(avatar.userIcon), avatarFileId(LIVE), '不得回落到好友当前图标（定案 B 要修的正是这个混排）');
+});
+
+
+// ── 2026-09-27：模型名可信性（parseAvatarName 对「非 Avatar 命名」原样返回 ⇒ blob/文件名会被当模型名） ──
+test('模型名可信性判据 + DTO 过滤：blob/文件名类脏值不得作为模型名展示', async () => {
+  const { isPlausibleAvatarName } = await import(pathToFileURL(path.join(REPO, 'core', 'img-util.js')).href);
+  assert.equal(isPlausibleAvatarName('タフィー バニー'), true, '正常模型名要通过');
+  assert.equal(isPlausibleAvatarName('file_c3f51535-f3bb-4d6a-90f6-0a67ab53b422_blob'), false, 'blob 文件名要挡掉');
+  assert.equal(isPlausibleAvatarName('file_11111111-0000-0000-0000-000000000001'), false, '裸 file id 要挡掉');
+  assert.equal(isPlausibleAvatarName('c3f51535-f3bb-4d6a-90f6-0a67ab53b422'), false, '裸 UUID 要挡掉');
+  assert.equal(isPlausibleAvatarName('image.png'), false, '图片文件名要挡掉');
+  assert.equal(isPlausibleAvatarName(''), false);
+
+  // DTO 层：载荷里存了 blob 名也不得原样透出
+  const U3 = 'usr_test-name-0000-0000-0000-000000000003';
+  ctx.storage.upsertFriend({ userId: U3, displayName: '名字测试', userIcon: '', avatarImageUrl: '', bio: '', status: 'active' });
+  ctx.storage.insertEvent({
+    type: 'friend-update', userId: U3, displayName: '名字测试',
+    contentJson: { userId: U3, displayName: '名字测试', type: 'avatar', avatarName: 'file_c3f51535-f3bb-4d6a-90f6-0a67ab53b422_blob', avatarImageUrl: 'https://api.vrchat.cloud/api/1/image/file_dddd4444-0000-0000-0000-00000000000d/1/256' },
+    worldId: '', worldName: '', createdAt: '2026-09-27T02:30:00.000Z', source: 'websocket',
+  });
+  const svc2 = loader.services.get('dashboard.events');
+  const res2 = await svc2({ limit: 100 });
+  const row = (res2.events || []).find((e) => e.userId === U3 && e.updateType === 'avatar');
+  assert.ok(row, '该行应在响应里');
+  assert.equal(row.avatarName, '', 'DTO 不得把 blob 名当模型名透出（应为空 ⇒ 前端显示未知模型）');
+});
+
+
+// ── 2026-09-27 审查（nixi-agent）复核后补的护栏：这两处修复很"隐形"，加源码级断言防回归 ──
+test('审查修复护栏：历史窗口按 created_at 排序 + 截断/失败必须留痕（不得静默降级）', () => {
+  const src = readFileSync(path.join(REPO, 'core', 'dashboard-services.js'), 'utf8');
+  assert.match(src, /ORDER BY created_at DESC LIMIT 400/,
+    '回填窗口必须按 created_at 排序（与索引同序；id 序 ≠ 时间序的老数据上按 id 会静默失效）');
+  assert.ok(!/ORDER BY id DESC LIMIT 400/.test(src), '不应再有按 id 排序的窗口');
+  assert.match(src, /头像历史回填按上限/, '回填截断必须留痕（审查 ⚠️1：此前静默）');
+  assert.match(src, /头像历史回填失败/, '取历史失败必须留痕（审查 ⚠️2：此前静默）');
+});
+
+// 2026-09-27 追加：审查指出「说明与代码不符（称按需、实为全量）」⇒ 用护栏钉住"真按需"
+test('审查修复护栏②：回填对象必须【按需】选取（friend-* 且载荷缺图标），不得再用全量 user_id', () => {
+  const src = readFileSync(path.join(REPO, 'core', 'dashboard-services.js'), 'utf8');
+  assert.match(src, /const needUids = /, '必须按需选取回填对象（needUids）');
+  assert.ok(!/const allUids = \[\.\.\.new Set\(rows\.map\(\(r\) => r\.user_id\)/.test(src),
+    '不应再以"本页全部 user_id"作为回填对象（通知类 id 会挤占名额）');
+  assert.match(src, /rt\.startsWith\('friend-'\) \|\| rt\.startsWith\('user-'\)/, '回填应覆盖 friend-* 与本人 user-* 行');
 });

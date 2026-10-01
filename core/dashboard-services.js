@@ -44,7 +44,7 @@ function worldCacheStale(updatedAt) {
   if (Number.isNaN(t)) return true;
   return Date.now() - t >= WORLD_CACHE_TTL_MS;
 }
-import { imgProxy, avatarThumb, avatarOf, avatarFileId } from './img-util.js';
+import { imgProxy, avatarThumb, avatarOf, avatarFileId, isPlausibleAvatarName } from './img-util.js';
 import { handleGetFriendWorldStats } from './tools/events.js';
 
 // 通知类型→中文标签（与前端 ui/src/utils.js 的 notificationTypeLabels 对齐，供 see/hide-notification 摘要拼类型）。
@@ -369,6 +369,66 @@ export function registerDashboardServices(loader, ctx) {
         region: rm ? rm[1] : '',
       };
     };
+    // ⭐ 2026-09-27（用户定案 B）：左侧圆头像一律取【该行当时】的图——
+    //   原先无图标载荷的行会回落到「好友当前图标」（friends 表实时值），于是同一列里
+    //   「当时快照」与「当前值」混排（用户截图：同一好友几行头像不一样）✗。
+    //   这里按 userId 取一段历史事件、抽出「带图标的那些」做时间 carry-forward：
+    //   该行有载荷图标 ⇒ 用它；否则取「该行时刻之前最近一次已知图标」；再没有才回落当前值（最老的行）。
+    // ⚠️1（审查 nixi-agent）：回填有上限，超出的行会静默沿用旧行为 ✗ ⇒ 必须留痕 ✓
+    // 💡1（审查 nixi-agent）：窗口按 created_at 排序（与索引 idx_events_user_time 同序；
+    //   实测 id 序 ≠ 时间序的老数据上，按 id 排序会让最近图标掉出窗口 ⇒ 静默失效）。
+    const HIST_CAP = 40;
+    const iconHistory = new Map();   // userId -> [{ t, icon }]（升序）
+    const histFailed = { n: 0 };
+    {
+      // ⚠️（审查 nixi-agent 指出「说明与代码不符」）：真正做【按需】—— 只取「本页里
+      //   是 friend-* 行、且载荷没带图标」的好友 id；通知类事件的 user_id 不再挤占名额 ✓
+      const needUids = [...new Set(rows.filter((r) => {
+        // ⚠️（审查 nixi-agent 第七轮）：把【本人行】也纳入 —— user-location / user-update 同样是
+        //   「位置/资料」行、同样可能没带图标；只认 friend-* 会让 SELF 行丢掉「该行当时」的图标回填
+        //   （实测 userIcon 由历史值变空；而动态流 playerAvatarOf 是 `x.userIcon || x.avatarUrl…` ⇒ **用户图标优先**
+        //   ⇒ 这条变化对默认前端【是可见的】（审查 EMeowAGENT 第五轮指出我此前写反了）⇒ 纳入本人行是必要的）✓ 仍排除 notification 等非人物行。
+        const rt = String(r.type || '');
+        if (!(rt.startsWith('friend-') || rt.startsWith('user-'))) return false;
+        let c = {};
+        try { c = JSON.parse(r.content_json || '{}'); } catch { /* 坏载荷按不需要处理 */ return false; }
+        const hasIcon = !!(c.userIcon || c.iconUrl || (c.user && (c.user.iconUrl || c.user.userIcon)));
+        return !hasIcon;
+      }).map((r) => r.user_id).filter(Boolean))];
+      const allUids = needUids;   // 语义别名（下方留痕沿用）
+      const uids = allUids.slice(0, HIST_CAP);
+      const tMax = rows.reduce((a, r) => (r.created_at > a ? r.created_at : a), '');
+      for (const uid of uids) {
+        try {
+          const histRows = ctx.storage.query(
+            `SELECT created_at AS t, content_json AS c FROM events WHERE user_id = $u AND created_at <= $t ORDER BY created_at DESC LIMIT 400`,
+            { $u: uid, $t: tMax });
+          const list = [];
+          for (const h of histRows) {
+            let c = {};
+            try { c = JSON.parse(h.c || '{}'); } catch { continue; }
+            const icon = c.userIcon || c.iconUrl || (c.user && (c.user.iconUrl || c.user.userIcon)) || '';
+            if (icon) list.push({ t: h.t, icon });
+          }
+          list.sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
+          iconHistory.set(uid, list);
+        } catch { histFailed.n++; }
+      }
+      // ⚠️1/⚠️2：截断与失败都按聚合留痕一行（本仓禁静默降级）✓
+      if (allUids.length > uids.length) {
+        log.info('头像历史回填按上限 ' + HIST_CAP + ' 截断：' + (allUids.length - uids.length) + ' 位好友未回填（其行仍回落「当前图标」）');
+      }
+      if (histFailed.n) {
+        log.warn('头像历史回填失败 ' + histFailed.n + ' 位好友（本次按「当前图标」回落）');
+      }
+    }
+    const histIconAt = (uid, t) => {
+      const list = iconHistory.get(uid);
+      if (!list || !list.length) return '';
+      let found = '';
+      for (const it of list) { if (it.t <= t) found = it.icon; else break; }
+      return found;
+    };
     const result = rows.map((row) => {
       // 无子类型的原始 friend-update/user-update 重推副本：diff 子事件已带完整详情，
       // 原始副本只会显示成无详情的"资料变化"噪音 → 不进动态流
@@ -450,7 +510,6 @@ export function registerDashboardServices(loader, ctx) {
         contentItemTypeLabel: ({ prop: '道具', bundle: '捆绑包', accessory: '配件', shared: '共享物品' }[content.itemType] || content.itemType || '物品'),
         contentItemName: (content.itemId && invItemCache[content.itemId]) ? invItemCache[content.itemId].name || '' : '',
         contentItemImageUrl: imgProxy((content.itemId && invItemCache[content.itemId]) ? invItemCache[content.itemId].imageUrl || '' : ''),
-        avatarUrl: avatarOf(row.userIcon || user.iconUrl, row.avatarUrl || content.avatarImageUrl || user.currentAvatarImageUrl),
         location,
         summary: row.type === 'friend-location' ? '位置变化'
           : row.type === 'friend-update' ? ({ avatar: '更换模型', status: '状态变化', bio: '简介变化', user_icon: '更新用户头像', pronouns: '更新代词' }[content.type] || '资料变化')
@@ -478,7 +537,7 @@ export function registerDashboardServices(loader, ctx) {
         previousStatus: content.previousStatus || '',
         previousStatusDescription: content.previousStatusDescription || '',
         avatarName: content.avatarName || user.currentAvatarName || '',
-        previousAvatarName: content.previousAvatarName || '',
+        previousAvatarName: isPlausibleAvatarName(content.previousAvatarName) ? content.previousAvatarName : '',
         // avatarId 富化：WS 推送不含 currentAvatar，从 planet_cache 的 imageUrl→avatarId 映射反查（_syncFriendAvatars 建立）
         avatarId: content.avatarId || user.currentAvatar || (() => {
           // 2026-09-22 #225：收敛到 avatarFileId()（原内联正则只认 /file/ ✗）
@@ -555,8 +614,9 @@ export function registerDashboardServices(loader, ctx) {
       try { ctx.storage.setPlanetCache(`avatar_name:${fileId}`, { name: '', miss: true, until: Date.now() + 6 * 3600 * 1000 }); } catch { /* 落盘失败不影响响应 */ }
     };
     const saveAvName = (fileId, name) => {
-      anCache.set(fileId, name);
-      try { ctx.storage.setPlanetCache(`avatar_name:${fileId}`, { name, at: Date.now() }); } catch { /* 落盘失败不影响响应 */ }
+      const ok = isPlausibleAvatarName(name);   // 2026-09-27：blob/文件名类脏值不入缓存
+      anCache.set(fileId, ok ? name : '');
+      try { ctx.storage.setPlanetCache(`avatar_name:${fileId}`, ok ? { name, at: Date.now() } : { name: '', miss: true, until: Date.now() + 6 * 3600 * 1000 }); } catch { /* 落盘失败不影响响应 */ }
     };
     // 群组名后台补全（限流）：缓存未命中的群组事件拉 /groups/{id} 回填 group_cache，本次响应立即返回
     const needGroup = [...new Set(result
@@ -638,7 +698,10 @@ export function registerDashboardServices(loader, ctx) {
         for (const { ev, fileId, key } of pending) {
           try {
             const a = await ctx.rateLimiter.execute(() => ctx.api._request('GET', `/file/${fileId}`));
-            const nm = parseAvName(a && a.data && a.data.name);
+            // 🔴 审查 EMeowAGENT 实测：本赋值发生在 DTO 出口过滤【之后】（异步 await 让出口循环先跑完），
+            //   故出口那层罩不住它 ⇒ 透出侧必须用同一判据过滤，否则 blob 名仍会作为模型名透出 ✓
+            const nmRaw = parseAvName(a && a.data && a.data.name);
+            const nm = isPlausibleAvatarName(nmRaw) ? nmRaw : '';
             if (nm) { ev[key] = nm; saveAvName(fileId, nm); try { log.debug(`[模型名] 已解析 ${fileId.slice(0,20)}… → ${nm}`); } catch { /* 日志失败忽略 */ } }
             else { log.info(`[模型名] 解析不出，落负缓存 6h：${fileId.slice(0,20)}…`); saveAvMiss(fileId); }   // 降级决策必须留痕 ✓
           } catch (e) { log.warn('[模型名] 解析失败（保留空名，下次再试）：' + (e && e.message ? e.message : e)); }
@@ -657,6 +720,18 @@ export function registerDashboardServices(loader, ctx) {
       const trow = ctx.storage.query(`SELECT COUNT(*) AS c FROM events ${tw}`, tp);
       total = trow[0] ? trow[0].c : 0;
     } catch { total = 0; }
+    // 💡1（审查 EMeowAGENT）：本出口只回填 userIcon；avatarUrl 仍走「好友当前值」⇒ 同一行两字段可能指向不同图。
+    //   前端左侧圆头像取 userIcon 优先，故显示正确；此处按现状保留（要彻底统一需另开 PR 把 avatarUrl 纳入同口径）。
+    // 2026-09-27（用户定案）：左侧圆头像一律取「该行当时」的图 —— 出口统一回填；
+    //   并把不可信的模型名（blob / 文件名类脏值）一并清掉。统一放出口，避免改动散落影响无关上下文。
+    for (const ev of result) {
+      if (!ev.userIcon) {
+        const hist = histIconAt(ev.userId, ev.createdAt);
+        if (hist) ev.userIcon = imgProxy(hist);
+      }
+      if (ev.avatarName && !isPlausibleAvatarName(ev.avatarName)) ev.avatarName = '';
+      if (ev.previousAvatarName && !isPlausibleAvatarName(ev.previousAvatarName)) ev.previousAvatarName = '';
+    }
     return { events: result, total };
   });
   loader.serviceOwners.set('dashboard.events', 'core');
