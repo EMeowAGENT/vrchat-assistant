@@ -27,6 +27,7 @@ description: VRChat 社区活动聚合插件：多源采集、群组深度挖掘
      naive（无时区标记）**先按数据源还原真实 UTC**（`naiveBaseOffsetH(src)`：VRC Search=UTC(0)、RLVRC=+8 北京时间），
      再按 languages/lang 判社团本地时区（ja→JST+9 / ko→KST+9 / zh→+8 / ru→MSK+3 / 其他→美东 ET-4）；
      aware（如 VRCEve `+09:00`）直接读自带偏移。
+     尾随 `Z` **锚定**判定；aware 形态但解析失败（坏偏移/尾随杂物）**回落 naive 分支**按源基准偏移还原，不静默丢时间列。
    - `join_info_zh`：VRCEve 日文 `【参加方法】` 规则化中文（加入群组房间「名」等）
    - `category_zh`：category 中文映射
 6. **limit 截断（未来优先）**：窗口内常有上千场，排序主键是群组人数、与时间无关，
@@ -65,6 +66,7 @@ VRC Search（`search.vrcwwt.com`）被 **Cloudflare JS 挑战**保护：裸 HTTP
   `sourceBreakdown.vrcsearch = { count:0, ok:0, fail:0, queried:false, not_queried:true, reason:'…' }`
   并**只打一行日志**，**绝不**再对 56 个 URL 逐个发裸请求（既刷 fail 又白等）。即使调用方显式 `sources:'vrcsearch'`，整单也不抛错，返回的是结构化降级结果（其余源不受影响）。
 - **重试**：整批最多重试 **1 次**（首批抓到页面但 0 命中时）；不做 56 次独立重试。
+- **并发**：同一批 URL 的并发调用**复用进行中的那一次**（single-flight）；不同批次**串行**执行——同一部署不会同时拉起多个有头浏览器（core 侧 `browserFetchMany` 内建排队）。
 - **相关环境变量**（在 core 侧生效，见 AGENTS.md 环境变量清单）：`VRC_MONITOR_BROWSER_FETCH`（`'0'` 关闭整条通道）、`VRC_MONITOR_BROWSER_FETCH_CHANNEL`（默认 `auto`）、`VRC_MONITOR_BROWSER_FETCH_TIMEOUT_MS`（默认 `45000`，单页预算上界）。
 - **代理（先代理后直连）**：浏览器通道读本插件 `httpGet` 同一批变量（`VRC_MONITOR_HTTP_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` …），无法按源区分；但**只在显式配置时才走代理，默认直连**，且与 `core/fetch-x-worlds.js` 同口径做了回退：第一页因代理不可达失败（`ERR_PROXY_CONNECTION_FAILED`）时，关闭浏览器 → 直连重建 → 从同一页继续，并留一行 INFO（`代理不可达…剩余 N 页回退直连`）。实测本机 `VRC_MONITOR_HTTP_PROXY` 指向未启动的 Clash 时，仍 56/56 页 200、53.9s（channel=msedge, 直连）。遗留的坏代理变量不会把整个源判死。
 

@@ -167,3 +167,37 @@ test('limit 非法值回落 1（不会因 NaN 把结果清空）', () => {
   assert.equal(selectWithinLimit(list, 0, NOW).picked.length, 1);
   assert.equal(selectWithinLimit(list, 'abc', NOW).picked.length, 1);
 });
+
+// ── 7. 脏串 / aware 解析失败：不得静默丢时间列（审查 ⚠️1 回归）──────
+// 旧写法 /[zZ]/ 未锚定：`2026-10-03 13:00 zzz` 被判成 aware ⇒ Date.parse 失败 ⇒ 三列全空。
+test('含 z 的脏串不再被误判 aware：回落 naive，时间列不空（审查 ⚠️1）', () => {
+  const tz = eventTzInfo(vrcSearch('2026-10-03 13:00 zzz'));
+  assert.notEqual(tz.start_bj, '', '不得静默丢时间列');
+  assert.notEqual(tz.start_local, '', '不得静默丢时间列');
+  assert.notEqual(tz.tz_label, '', '不得静默丢时区标签');
+  assert.equal(tz.start_bj, '10-03 21:00', 'VRC Search naive=UTC ⇒ 北京 21:00');
+  // RLVRC 的脏串仍按北京时间基准
+  assert.equal(eventTzInfo(rlvrc('2026-10-03 21:00 zzz')).start_bj, '10-03 21:00');
+});
+
+test('尾随 Z 仍按 aware(UTC) 解析（锚定 Z 不得误伤正常输入）', () => {
+  const tz = eventTzInfo(vrcSearch('2026-10-03T13:00:00Z'));
+  assert.equal(tz.start_bj, '10-03 21:00');
+  assert.equal(tz.tz_label, 'UTC');
+  assert.equal(tz.tz_offset, 0);
+  // +09:00 的 aware（VRCEve）同样不受影响
+  assert.equal(eventTzInfo(vrceve('2026-10-03T21:00:00+09:00')).start_bj, '10-03 20:00');
+});
+
+test('aware 形态但偏移非法（+99:99）⇒ 回落 naive，不丢列', () => {
+  const tz = eventTzInfo(vrcSearch('2026-10-03T13:00:00+99:99'));
+  assert.equal(tz.start_bj, '10-03 21:00');
+  assert.notEqual(tz.start_local, '');
+});
+
+test('eventStartMs 同样容错（脏串/坏偏移不再 NaN）', () => {
+  assert.equal(eventStartMs(vrcSearch('2026-10-03 13:00 zzz')), Date.parse('2026-10-03T13:00:00Z'));
+  assert.equal(eventStartMs(rlvrc('2026-10-03 21:00 zzz')), Date.parse('2026-10-03T13:00:00Z'));
+  assert.equal(eventStartMs(vrcSearch('2026-10-03T13:00:00+99:99')), Date.parse('2026-10-03T13:00:00Z'));
+  assert.ok(Number.isNaN(eventStartMs(vrcSearch('乱码没时间'))), '取不到前导时间戳才 NaN');
+});

@@ -19,9 +19,28 @@ export function naiveBaseOffsetH(src) {
   return s.includes('rlvrc') ? 8 : 0;
 }
 
+// ── 时区判定/解析的公共形态 ───────────────────────────────────────────
+//   尾随 Z 必须**锚定**：旧写法 /[zZ]/ 会把含 z 的脏串（如 `2026-10-03 13:00 zzz`）误判成 aware，
+//   随后 Date.parse 失败 ⇒ 时间列整列变空（**静默丢时间**，与仓库「禁静默降级」取向相悖）。
+const HAS_TZ_RE = /[zZ]$|[+-]\d{2}:?\d{2}$|[+-]\d{4}$/;
+
+/**
+ * 宽容解析 naive 串的**前导** `YYYY-MM-DD[T ]HH:MM`（容忍尾部杂物，如 `… 13:00 zzz`），
+ * 再按数据源基准偏移还原真实 UTC。只有连前导时间戳都取不到时才返回 NaN。
+ */
+export function naiveUtcMs(raw, src) {
+  const s = String(raw || '').trim().replace(' ', 'T');
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+  if (!m) return NaN;
+  const ms = Date.parse(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:00Z`);
+  if (isNaN(ms)) return NaN;
+  return ms - naiveBaseOffsetH(src) * 3600 * 1000;
+}
+
 // ── 数据后处理：双列时区（活动本地时间 + 北京时间）──────────────────
 //   naive（无时区）：先按 naiveBaseOffsetH(src) 还原真实 UTC 时刻，再按社团语言判本地偏移；
-//   aware（带偏移，如 VRCEve +09:00=JST）：直接用自带偏移。
+//   aware（带偏移，如 VRCEve +09:00=JST）：直接用自带偏移；
+//   aware 形态但解析失败（坏偏移/尾随杂物）⇒ **回落 naive 分支**，不把整列留空。
 export function eventTzInfo(e) {
   const out = { start_local: '', start_bj: '', tz_label: '', tz_offset: 0 };
   const t = e && e.start;
@@ -29,31 +48,27 @@ export function eventTzInfo(e) {
   const BJ_OFF = 8 * 3600 * 1000;
   try {
     const raw = String(t);
-    const hasTz = /[zZ]|[+-]\d{2}:?\d{2}$|[+-]\d{4}$/.test(raw.trim());
-    if (!hasTz) {
-      // naive: 按源还原真实 UTC（RLVRC 的 naive 是北京时间，不是 UTC）
-      const iso = raw.trim().replace(' ', 'T') + 'Z';   // 补 Z 后 Date.parse 才可用
-      const utcMs = Date.parse(iso) - naiveBaseOffsetH(e.src) * 3600 * 1000;
-      if (isNaN(utcMs)) return out;
-      const offH = localOffsetHs(e);
-      out.start_local = fmtDtUtc(utcMs + offH * 3600 * 1000);
-      out.start_bj = fmtDtUtc(utcMs + BJ_OFF);
+    const s = raw.trim();
+    const iso = s.replace(' ', 'T');
+    const awareMs = HAS_TZ_RE.test(s) ? Date.parse(iso) : NaN;
+    if (!isNaN(awareMs)) {
+      // aware: 自带偏移。北京=偏移→UTC再+8；本地=原时区字段
+      const oz = iso.match(/[+-](\d{2}):?(\d{2})$/);
+      const offH = oz ? (+oz[1] + (+oz[2] / 60)) : 0;
+      out.start_local = rawLocal(iso);                    // 本地=原时区字段
+      out.start_bj = fmtDtUtc(awareMs + BJ_OFF);          // 北京=UTC+8
       out.tz_offset = offH;
       out.tz_label = tzName(offH, e);
     } else {
-      // aware: 自带偏移。北京=偏移→UTC再+8；本地=原时区字段
-      const iso = raw.trim().replace(' ', 'T');
-      const dt = new Date(iso);
-      if (isNaN(dt.getTime())) return out;
-      // Date.parse(iso) 直接就是 UTC 纪元毫秒（已按 ISO 自带偏移换算）
-      const utcMs = Date.parse(iso);
-      // 解析字符串里显式的偏移（若 ISO 有偏移）；无则推断为 0
-      const oz = String(iso).match(/[+-](\d{2}):?(\d{2})$/);
-      const offH = oz ? (+oz[1] + (+oz[2] / 60)) : 0;
-      out.start_local = rawLocal(iso);                    // 本地=原时区字段
-      out.start_bj = fmtDtUtc(utcMs + BJ_OFF);            // 北京=UTC+8
-      out.tz_offset = offH;
-      out.tz_label = tzName(offH, e);
+      // naive，或 aware 串解析失败 → 按源基准偏移还原（RLVRC 的 naive 是北京时间，不是 UTC）
+      const utcMs = naiveUtcMs(raw, e.src);
+      if (!isNaN(utcMs)) {
+        const offH = localOffsetHs(e);
+        out.start_local = fmtDtUtc(utcMs + offH * 3600 * 1000);
+        out.start_bj = fmtDtUtc(utcMs + BJ_OFF);
+        out.tz_offset = offH;
+        out.tz_label = tzName(offH, e);
+      }
     }
   } catch (err) {}
   const js = String(t);
@@ -103,13 +118,16 @@ export function rawLocal(iso) {
 }
 
 // 事件开始时刻 → UTC 纪元毫秒（与 eventTzInfo 同一口径；无法解析返回 NaN）
+//   aware 形态但解析失败（坏偏移/尾随杂物）同样回落 naive 分支，避免「有前导时间戳却判成无法解析」。
 export function eventStartMs(e) {
   const raw = String((e && e.start) || '').trim();
   if (!raw) return NaN;
-  const iso = raw.replace(' ', 'T');
-  const hasTz = /[zZ]|[+-]\d{2}:?\d{2}$|[+-]\d{4}$/.test(iso);
-  const ms = hasTz ? Date.parse(iso) : Date.parse(iso + 'Z') - naiveBaseOffsetH(e && e.src) * 3600 * 1000;
-  return Number.isFinite(ms) ? ms : NaN;
+  if (HAS_TZ_RE.test(raw)) {
+    const ms = Date.parse(raw.replace(' ', 'T'));
+    if (Number.isFinite(ms)) return ms;
+  }
+  const ms2 = naiveUtcMs(raw, e && e.src);
+  return Number.isFinite(ms2) ? ms2 : NaN;
 }
 
 /**

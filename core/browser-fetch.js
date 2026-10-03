@@ -157,11 +157,35 @@ async function fetchOnePage(page, url, pageBudgetMs) {
  * @returns {Promise<{ok:boolean, reason?:string, results:Array<{url:string,status:number,body:string,error?:string}>, durationMs:number}>}
  *   整体不可用（关闭 / playwright 缺失 / 无通道 / 启动失败 / 挑战没过 / 预算用尽）时
  *   ok=false + reason，results 仍逐个 URL 给出 error 标注；**不 throw**，调用方据此结构化降级。
+ *
+ * 并发：**同一批 URL** 的并发调用复用进行中的那一次（single-flight）；**不同批次**串行执行
+ *   （同一部署里的两次调用不会各自拉起一个 headful 浏览器）。
  */
-export async function browserFetchMany(urls, opts = {}) {
+// ── 并发控制 ──────────────────────────────────────────────────────────
+//   同一批 URL 的并发调用复用「进行中的那一次」；不同批次**串行**执行——否则同一部署里两次
+//   fetch_community_events 并发会各拉起一个 headful 浏览器（内存与挑战次数都翻倍）。
+let _inFlight = null;              // { key, promise }：进行中的抓取（按 URL 列表去重）
+let _queue = Promise.resolve();    // 批次串行链
+
+export function browserFetchMany(urls, opts = {}) {
+  const list = (Array.isArray(urls) ? urls : []).map(u => String(u || '').trim()).filter(Boolean);
+  const key = list.join('\n');
+  if (list.length && _inFlight && _inFlight.key === key) {
+    logApp.info(`同一批 ${list.length} 个 URL 的抓取已在进行中，复用该次结果（不重复拉起浏览器）`);
+    return _inFlight.promise;
+  }
+  const run = () => browserFetchManyUnsafe(list, opts);
+  const p = _queue.then(run, run);          // 前一批失败也要继续执行本批
+  _queue = p.then(() => {}, () => {});      // 串行链吞掉结果/异常，避免未处理拒绝
+  if (list.length) _inFlight = { key, promise: p };
+  const clear = () => { if (_inFlight && _inFlight.promise === p) _inFlight = null; };
+  p.then(clear, clear);
+  return p;
+}
+
+async function browserFetchManyUnsafe(list, opts = {}) {
   const startedAt = Date.now();
   const cfg = getBrowserFetchConfig();
-  const list = (Array.isArray(urls) ? urls : []).map(u => String(u || '').trim()).filter(Boolean);
   const results = [];
 
   const finish = (reason) => ({
