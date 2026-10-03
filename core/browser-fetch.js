@@ -26,14 +26,22 @@ const MIN_PAGE_TIMEOUT_MS = 3000; // 单页剩余预算低于此值就不再开�
  * 运行时读配置。start-monitor.js 先 import 核心模块、后加载 .env，
  * 故顶层 const 会取到空值 —— 一律调用时读 process.env。
  * 变量名刻意不含 KEY/SECRET/TOKEN/PASSWORD/COOKIE/AUTH 子串（与仓库既有规范一致）。
+ *
+ * 导出为纯函数以便单测（审查 W1）：`parseInt(...) || 默认` 只兜住 0/NaN，**负值会穿透**，
+ * 一旦 perPageMs 为负，整批预算坍缩成 `URL 数×3s`、单页几百 ms 就 deadline_exceeded。
+ * 故非正数/空/非数字**一律回落默认**。
  */
-function getBrowserFetchConfig() {
-  const env = process.env;
+export function resolveBrowserFetchConfig(env = process.env) {
+  const rawTimeout = parseInt(env.VRC_MONITOR_BROWSER_FETCH_TIMEOUT_MS, 10);
   return {
     enabled: env.VRC_MONITOR_BROWSER_FETCH !== '0',           // '0' 关闭，默认开
     channel: env.VRC_MONITOR_BROWSER_FETCH_CHANNEL || 'auto', // auto|msedge|chrome|chromium
-    timeoutMs: parseInt(env.VRC_MONITOR_BROWSER_FETCH_TIMEOUT_MS, 10) || 45000,
+    timeoutMs: Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : 45000,
   };
+}
+
+function getBrowserFetchConfig() {
+  return resolveBrowserFetchConfig(process.env);
 }
 
 // ── 代理解析：与 core/fetch-x-worlds.js resolveProxy 同口径 —— 默认【直连】，仅显式配置才走代理 ──
@@ -87,6 +95,8 @@ async function detectChannel(pw, requestedChannel, launchArgs) {
  */
 async function fetchOnePage(page, url, pageBudgetMs) {
   const startedAt = Date.now();
+  // 单页预算自**进入本函数**起算：否则实际耗时可达 goto + 轮询两段预算（约 2×）。
+  const deadline = startedAt + pageBudgetMs;
   let mainStatus = 0;
   // 主文档状态：挑战放行后浏览器会重新导航到同一 URL，取最后一次匹配的主文档响应
   const onResponse = (res) => {
@@ -96,10 +106,9 @@ async function fetchOnePage(page, url, pageBudgetMs) {
   };
   page.on('response', onResponse);
   try {
-    const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: pageBudgetMs });
+    const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: Math.max(1000, deadline - Date.now()) });
     if (resp) mainStatus = resp.status();
 
-    const deadline = Date.now() + pageBudgetMs;
     let challengeSince = 0;    // 本次连续处于挑战页的起始时刻（放行后归零）
     let lastWasChallenge = false;
     let settled = false;

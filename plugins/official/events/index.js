@@ -201,7 +201,9 @@ export default function register(api) {
     }
     let r;
     try {
-      r = await api.consume('web.browserFetchMany', { urls: targets.map(t => t.url), timeoutMs: 45000 });
+      // 不传 timeoutMs：单页预算统一由 core 读 VRC_MONITOR_BROWSER_FETCH_TIMEOUT_MS（默认 45000）；
+      // 插件写死 45000 会让该 env **只能下调、无法上调**（审查建议）。
+      r = await api.consume('web.browserFetchMany', { urls: targets.map(t => t.url) });
     } catch (e) {
       api.log(`[失败] VRC Search 调用浏览器服务异常：${String(e.message || e).slice(0, 160)} → 整源跳过`);
       return { unavailable: true, reason: 'consume_failed' };
