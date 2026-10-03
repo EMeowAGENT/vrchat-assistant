@@ -128,6 +128,58 @@ export default function register(api) {
     }
   }
 
+  /**
+   * 发布/覆盖群公告（POST /groups/{groupId}/announcement）。
+   * ⚠️ 这是 legacy 的**单公告槽**：发布即覆盖已有公告（spec 原话 "will also remove all announcements"）。
+   * 所以默认要求 confirm，且 sendNotification 默认 false（不主动打扰全员）。
+   * 发之前先自查 myMember.permissions —— 权限不足时直接返回原因，
+   * 不要拿一个 403 让上层去猜（403 只说明"发不出去"，说不清是权限、地域还是限流）。
+   */
+  async function handleSetGroupAnnouncement({ groupId, title, text, imageId, sendNotification, confirm }) {
+    if (!groupId) throw new Error('groupId is required');
+    if (!title) throw new Error('title is required');
+    if (!text) throw new Error('text is required');
+    if (confirm !== true) {
+      return {
+        groupId,
+        confirmRequired: true,
+        message: 'This REPLACES the group\'s existing announcement and (with sendNotification) pings every member. Pass confirm: true to publish.',
+      };
+    }
+    const g = await api.vrchat.fetch(`/groups/${groupId}`);
+    const permissions = Array.isArray(g?.myMember?.permissions) ? g.myMember.permissions : [];
+    if (!permissions.includes('group-announcement-manage')) {
+      return {
+        groupId,
+        permitted: false,
+        posted: false,
+        message: 'Missing permission "group-announcement-manage" - your group role cannot publish announcements.',
+      };
+    }
+    const body = { title, text, sendNotification: sendNotification === true };
+    if (imageId) body.imageId = imageId;
+    // ⚠️ body 必须传**对象**：api.vrchat.fetch → ctx.api._request → _requestRaw 内部
+    // 已经 `req.write(JSON.stringify(body))`；这里再 stringify 一次会**双重编码**
+    // （服务端收到的是 JSON 字符串字面量而不是对象）。headers 也不必给——fetch 只读 method/body。
+    const a = await api.vrchat.fetch(`/groups/${groupId}/announcement`, {
+      method: 'POST',
+      body,
+    });
+    return {
+      groupId,
+      posted: true,
+      announcement: {
+        id: a?.id,
+        title: a?.title,
+        text: a?.text,
+        authorId: a?.authorId,
+        authorName: await resolveUserName(a?.authorId),
+        createdAt: a?.createdAt,
+        updatedAt: a?.updatedAt,
+      },
+    };
+  }
+
   async function handleSearchGroups({ query, n }) {
     if (!query || typeof query !== 'string') throw new Error('query is required');
     const limit = Math.min(Math.max(parseInt(n, 10) || 30, 1), 100);
@@ -382,6 +434,25 @@ export default function register(api) {
       required: ['groupId'],
     },
     handler: async (args) => handleGetGroupAnnouncement(args),
+  });
+
+  api.registerTool({
+    name: 'set_group_announcement',
+    description: '[group] Create or REPLACE a group announcement (title + text). Replaces the existing announcement; sendNotification=true pings every member. Requires the group-announcement-manage permission and confirm: true.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        groupId: { type: 'string', description: 'VRChat group id (grp_...)' },
+        title: { type: 'string', description: 'Announcement title' },
+        text: { type: 'string', description: 'Announcement body text' },
+        imageId: { type: 'string', description: 'Optional VRChat file id (file_...) to attach' },
+        sendNotification: { type: 'boolean', description: 'Send a notification to all group members (default false)' },
+        confirm: { type: 'boolean', description: 'Must be true to actually publish; otherwise returns a preview only' },
+      },
+      required: ['groupId', 'title', 'text'],
+    },
+    destructive: true,
+    handler: async (args) => handleSetGroupAnnouncement(args),
   });
 
   api.registerTool({
