@@ -129,6 +129,23 @@ export default function register(api) {
   }
 
   /**
+   * 公告写操作的权限自查（set / delete 共用）。
+   * 返回 null = 有权限可写；否则返回一个**应直接回给调用方**的拒绝结果。
+   */
+  async function checkAnnouncementPermission(groupId) {
+    const g = await api.vrchat.fetch(`/groups/${groupId}`);
+    const permissions = Array.isArray(g?.myMember?.permissions) ? g.myMember.permissions : [];
+    if (!permissions.includes('group-announcement-manage')) {
+      return {
+        groupId,
+        permitted: false,
+        message: 'Missing permission "group-announcement-manage" - your group role cannot manage announcements.',
+      };
+    }
+    return null;
+  }
+
+  /**
    * 发布/覆盖群公告（POST /groups/{groupId}/announcement）。
    * ⚠️ 这是 legacy 的**单公告槽**：发布即覆盖已有公告（spec 原话 "will also remove all announcements"）。
    * 所以默认要求 confirm，且 sendNotification 默认 false（不主动打扰全员）。
@@ -146,16 +163,8 @@ export default function register(api) {
         message: 'This REPLACES the group\'s existing announcement and (with sendNotification) pings every member. Pass confirm: true to publish.',
       };
     }
-    const g = await api.vrchat.fetch(`/groups/${groupId}`);
-    const permissions = Array.isArray(g?.myMember?.permissions) ? g.myMember.permissions : [];
-    if (!permissions.includes('group-announcement-manage')) {
-      return {
-        groupId,
-        permitted: false,
-        posted: false,
-        message: 'Missing permission "group-announcement-manage" - your group role cannot publish announcements.',
-      };
-    }
+    const denied = await checkAnnouncementPermission(groupId);
+    if (denied) return { ...denied, posted: false };
     const body = { title, text, sendNotification: sendNotification === true };
     if (imageId) body.imageId = imageId;
     // ⚠️ body 必须传**对象**：api.vrchat.fetch → ctx.api._request → _requestRaw 内部
@@ -178,6 +187,25 @@ export default function register(api) {
         updatedAt: a?.updatedAt,
       },
     };
+  }
+
+  /**
+   * 删除群公告（DELETE /groups/{groupId}/announcement）。
+   * ⚠️ **不可恢复**：legacy 单公告槽没有历史版本，删掉就没了，所以强制 confirm。
+   */
+  async function handleDeleteGroupAnnouncement({ groupId, confirm }) {
+    if (!groupId) throw new Error('groupId is required');
+    if (confirm !== true) {
+      return {
+        groupId,
+        confirmRequired: true,
+        message: 'This permanently deletes the group\'s current announcement (no history, not recoverable). Pass confirm: true to delete.',
+      };
+    }
+    const denied = await checkAnnouncementPermission(groupId);
+    if (denied) return { ...denied, deleted: false };
+    await api.vrchat.fetch(`/groups/${groupId}/announcement`, { method: 'DELETE' });
+    return { groupId, deleted: true };
   }
 
   async function handleSearchGroups({ query, n }) {
@@ -453,6 +481,21 @@ export default function register(api) {
     },
     destructive: true,
     handler: async (args) => handleSetGroupAnnouncement(args),
+  });
+
+  api.registerTool({
+    name: 'delete_group_announcement',
+    description: '[group] Delete the group announcement. NOT recoverable (legacy single-announcement slot keeps no history). Requires the group-announcement-manage permission and confirm: true.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        groupId: { type: 'string', description: 'VRChat group id (grp_...)' },
+        confirm: { type: 'boolean', description: 'Must be true to actually delete; otherwise returns a preview only' },
+      },
+      required: ['groupId'],
+    },
+    destructive: true,
+    handler: async (args) => handleDeleteGroupAnnouncement(args),
   });
 
   api.registerTool({
