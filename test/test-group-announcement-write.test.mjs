@@ -26,14 +26,17 @@ const PERM = 'group-announcement-manage';
 const ENDPOINT = `/groups/${GROUP_ID}/announcement`;
 
 /** 构造假 api：收集 registerTool 的 def，并记录每一次 fetch 调用 */
-function makeApi({ permissions = [PERM], postResult = {} } = {}) {
+function makeApi({ permissions = [PERM], postResult = {}, postError = null } = {}) {
   const tools = new Map();
   const calls = [];
   const api = {
     vrchat: {
       async fetch(p, opts = {}) {
         calls.push({ path: p, opts });
-        if (opts && opts.method === 'POST') return postResult;
+        if (opts && opts.method === 'POST') {
+          if (postError) throw postError;
+          return postResult;
+        }
         if (p === `/groups/${GROUP_ID}`) return { id: GROUP_ID, myMember: { permissions } };
         return {};
       },
@@ -118,6 +121,28 @@ test('set: sendNotification:true 与 imageId 透传', async () => {
   const body = calls.find((c) => c.opts && c.opts.method === 'POST').opts.body;
   assert.equal(body.sendNotification, true);
   assert.equal(body.imageId, 'file_abc');
+});
+
+test('set: 服务端 400 时把服务端原因带进错误文案', async () => {
+  const err = new Error('VRChat API 请求失败: 400 /groups/x/announcement');
+  err.status = 400;
+  err.response = { error: { message: 'Text is too long' } };
+  const { set } = await setup({ postError: err });
+  await assert.rejects(
+    () => set.handler({ groupId: GROUP_ID, title: 'T', text: 'B', confirm: true }),
+    /Text is too long/,
+  );
+});
+
+test('set: 非 400 错误原样抛出，不被改写', async () => {
+  const err = new Error('VRChat API 请求失败: 403 /groups/x/announcement');
+  err.status = 403;
+  err.response = { error: { message: 'Forbidden' } };
+  const { set } = await setup({ postError: err });
+  await assert.rejects(
+    () => set.handler({ groupId: GROUP_ID, title: 'T', text: 'B', confirm: true }),
+    (e) => e === err,
+  );
 });
 
 // ────────────────────────── delete ──────────────────────────

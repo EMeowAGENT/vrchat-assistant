@@ -170,10 +170,19 @@ export default function register(api) {
     // ⚠️ body 必须传**对象**：api.vrchat.fetch → ctx.api._request → _requestRaw 内部
     // 已经 `req.write(JSON.stringify(body))`；这里再 stringify 一次会**双重编码**
     // （服务端收到的是 JSON 字符串字面量而不是对象）。headers 也不必给——fetch 只读 method/body。
-    const a = await api.vrchat.fetch(`/groups/${groupId}/announcement`, {
-      method: 'POST',
-      body,
-    });
+    let a;
+    try {
+      a = await api.vrchat.fetch(`/groups/${groupId}/announcement`, { method: 'POST', body });
+    } catch (e) {
+      // 服务端 400 的原因（正文超长 / 含不被接受的字符等）原样带出来，
+      // 别让上层只看到 "400 /groups/xxx/announcement" 去猜。
+      // ⚠️ 只改写 400 —— 其它状态码与网络错误原样抛，不吞不改（有对应用例钉住）。
+      const reason = e?.response?.error?.message;
+      if (e?.status === 400 && typeof reason === 'string' && reason) {
+        throw new Error(`发布群公告被 VRChat 拒绝（400）：${reason}`);
+      }
+      throw e;
+    }
     return {
       groupId,
       posted: true,
