@@ -384,9 +384,8 @@ export default function register(api) {
         groupId,
         postId,
         confirmRequired: true,
-        message: 'This permanently deletes one group post. Pass confirm: true to delete. '
-          + 'The body may still be checked against the group audit log (eventType "group.announcement" keeps title/text) '
-          + 'if the caller kept a local archive - this tool cannot restore it.',
+        message: 'This permanently deletes one group post - NOT recoverable, this tool cannot restore it. '
+          + 'Pass confirm: true to delete.',
       };
     }
     const denied = await checkAnnouncementPermission(groupId);

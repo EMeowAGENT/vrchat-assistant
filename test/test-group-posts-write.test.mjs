@@ -252,12 +252,13 @@ test('delete: 缺 groupId / postId 时抛错', async () => {
   await assert.rejects(() => del.handler({ groupId: GROUP_ID }), /postId is required/);
 });
 
-test('delete: confirm 不为 true → 返回预览（说明审计日志可核对），且一次请求都不发', async () => {
+test('delete: confirm 不为 true → 返回预览（一句话说明不可恢复），且一次请求都不发', async () => {
   const { del, calls } = await setup({});
   const r = await del.handler({ groupId: GROUP_ID, postId: POST_ID });
   assert.equal(r.confirmRequired, true);
   assert.equal(r.deleted, undefined);
-  assert.match(r.message, /audit log/);
+  assert.match(r.message, /NOT recoverable/);
+  assert.doesNotMatch(r.message, /audit log/, '预览文案已简化，不再夹带审计日志那串绕口表述');
   assert.equal(calls.length, 0, 'confirm 缺失时不允许发出任何请求');
 });
 
