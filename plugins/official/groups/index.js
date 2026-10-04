@@ -217,6 +217,172 @@ export default function register(api) {
     return { groupId, deleted: true };
   }
 
+  // ────────────────── 群组帖子 posts（官方多帖接口）──────────────────
+  // POST /groups/{gid}/announcement 是 legacy **单槽**：发新帖即顶掉旧帖（实测踩过事故）。
+  // /groups/{gid}/posts 才是追加式时间线：POST 追加、PUT/DELETE 改删单条、GET 列表。
+  // 权限位：实测群 roles 与 /groups/roleTemplates 里没有任何 "post" 权限，
+  // 发帖沿用 group-announcement-manage（即 checkAnnouncementPermission）。
+
+  function normalizePostVisibility(v) {
+    const vis = v === undefined || v === null || v === '' ? 'group' : v;
+    if (vis !== 'group' && vis !== 'public') {
+      throw new Error(`visibility must be "group" or "public", got ${JSON.stringify(vis)}`);
+    }
+    return vis;
+  }
+
+  async function handleGetGroupPosts({ groupId, n, offset, publicOnly }) {
+    if (!groupId) throw new Error('groupId is required');
+    const q = [];
+    const addNum = (key, v) => {
+      if (v === undefined || v === null || v === '') return;
+      const i = parseInt(v, 10);
+      if (Number.isFinite(i)) q.push(`${key}=${i}`);
+    };
+    addNum('n', n);
+    addNum('offset', offset);
+    if (publicOnly === true || publicOnly === 'true') q.push('publicOnly=true');
+    else if (publicOnly === false || publicOnly === 'false') q.push('publicOnly=false');
+    let data;
+    try {
+      data = await api.vrchat.fetch(`/groups/${groupId}/posts${q.length ? `?${q.join('&')}` : ''}`);
+    } catch (e) {
+      // 与 get_group_announcement 同口径：非成员 / 无帖子不是故障，回空态不抛错
+      if (e.status === 403 || e.status === 404) return { groupId, total: 0, count: 0, posts: [] };
+      throw e;
+    }
+    const list = Array.isArray(data?.posts) ? data.posts : [];
+    // 作者名按**去重后的 authorId** 查：逐帖各查一次会在每页白吃十几条 API 配额
+    const names = new Map();
+    for (const id of [...new Set(list.map((p) => p.authorId).filter(Boolean))]) {
+      names.set(id, await resolveUserName(id));
+    }
+    const posts = list.map((p) => ({
+      id: p.id,
+      title: p.title,
+      text: p.text,
+      visibility: p.visibility,
+      authorId: p.authorId,
+      authorName: names.get(p.authorId) || null,
+      createdAt: p.createdAt,
+      updatedAt: p.updatedAt,
+      imageUrl: p.imageUrl,
+      roleIds: p.roleIds,
+    }));
+    return { groupId, total: data?.total ?? posts.length, count: posts.length, posts };
+  }
+
+  async function handleCreateGroupPost({ groupId, title, text, visibility, sendNotification, imageId, roleIds, confirm }) {
+    if (!groupId) throw new Error('groupId is required');
+    if (!title) throw new Error('title is required');
+    if (!text) throw new Error('text is required');
+    const vis = normalizePostVisibility(visibility);
+    if (confirm !== true) {
+      return {
+        groupId,
+        confirmRequired: true,
+        message: 'This ADDS a post to the group feed; existing posts are kept. Pass confirm: true to publish.',
+      };
+    }
+    const denied = await checkAnnouncementPermission(groupId);
+    if (denied) return { ...denied, posted: false };
+    const body = { title, text, visibility: vis, sendNotification: sendNotification === true };
+    if (imageId) body.imageId = imageId;
+    if (roleIds) body.roleIds = roleIds;
+    let p;
+    try {
+      p = await api.vrchat.fetch(`/groups/${groupId}/posts`, { method: 'POST', body });
+    } catch (e) {
+      const reason = e?.response?.error?.message;
+      if (e?.status === 400 && typeof reason === 'string' && reason) {
+        throw new Error(`发布群帖子被 VRChat 拒绝（400）：${reason}`);
+      }
+      throw e;
+    }
+    return {
+      groupId,
+      posted: true,
+      post: {
+        id: p?.id,
+        title: p?.title,
+        text: p?.text,
+        visibility: p?.visibility,
+        authorId: p?.authorId,
+        authorName: await resolveUserName(p?.authorId),
+        createdAt: p?.createdAt,
+        updatedAt: p?.updatedAt,
+      },
+    };
+  }
+
+  async function handleUpdateGroupPost({ groupId, postId, title, text, visibility, confirm }) {
+    if (!groupId) throw new Error('groupId is required');
+    if (!postId) throw new Error('postId is required');
+    const edits = {};
+    if (title !== undefined && title !== null) edits.title = title;
+    if (text !== undefined && text !== null) edits.text = text;
+    if (visibility !== undefined && visibility !== null && visibility !== '') {
+      edits.visibility = normalizePostVisibility(visibility);
+    }
+    if (Object.keys(edits).length === 0) {
+      throw new Error('nothing to update: pass at least one of title / text / visibility');
+    }
+    if (confirm !== true) {
+      return {
+        groupId,
+        postId,
+        confirmRequired: true,
+        message: 'This EDITS an existing group post (the old body is overwritten). Pass confirm: true to save.',
+      };
+    }
+    const denied = await checkAnnouncementPermission(groupId);
+    if (denied) return { ...denied, updated: false };
+    let p;
+    try {
+      p = await api.vrchat.fetch(`/groups/${groupId}/posts/${postId}`, { method: 'PUT', body: edits });
+    } catch (e) {
+      const reason = e?.response?.error?.message;
+      if (e?.status === 400 && typeof reason === 'string' && reason) {
+        throw new Error(`修改群帖子被 VRChat 拒绝（400）：${reason}`);
+      }
+      throw e;
+    }
+    return {
+      groupId,
+      postId,
+      updated: true,
+      post: {
+        id: p?.id,
+        title: p?.title,
+        text: p?.text,
+        visibility: p?.visibility,
+        authorId: p?.authorId,
+        authorName: await resolveUserName(p?.authorId),
+        createdAt: p?.createdAt,
+        updatedAt: p?.updatedAt,
+      },
+    };
+  }
+
+  async function handleDeleteGroupPost({ groupId, postId, confirm }) {
+    if (!groupId) throw new Error('groupId is required');
+    if (!postId) throw new Error('postId is required');
+    if (confirm !== true) {
+      return {
+        groupId,
+        postId,
+        confirmRequired: true,
+        message: 'This permanently deletes one group post. Pass confirm: true to delete. '
+          + 'The body may still be checked against the group audit log (eventType "group.announcement" keeps title/text) '
+          + 'if the caller kept a local archive - this tool cannot restore it.',
+      };
+    }
+    const denied = await checkAnnouncementPermission(groupId);
+    if (denied) return { ...denied, deleted: false };
+    await api.vrchat.fetch(`/groups/${groupId}/posts/${postId}`, { method: 'DELETE' });
+    return { groupId, postId, deleted: true };
+  }
+
   async function handleSearchGroups({ query, n }) {
     if (!query || typeof query !== 'string') throw new Error('query is required');
     const limit = Math.min(Math.max(parseInt(n, 10) || 30, 1), 100);
@@ -475,7 +641,7 @@ export default function register(api) {
 
   api.registerTool({
     name: 'set_group_announcement',
-    description: '[group] Create or REPLACE a group announcement (title + text). Replaces the existing announcement; sendNotification=true pings every member. Requires the group-announcement-manage permission and confirm: true.',
+    description: '[group] Create or REPLACE a group announcement (title + text). Replaces the existing announcement; sendNotification=true pings every member. Requires the group-announcement-manage permission and confirm: true. Legacy single-slot endpoint: it replaces the existing announcement. To ADD a post without replacing, use create_group_post.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -505,6 +671,78 @@ export default function register(api) {
     },
     destructive: true,
     handler: async (args) => handleDeleteGroupAnnouncement(args),
+  });
+
+  api.registerTool({
+    name: 'get_group_posts',
+    description: '[group] List a group\'s post feed (the official multi-post endpoint - unlike the legacy single-slot announcement, posts accumulate). Returns id/title/text/visibility/author/createdAt/roleIds per post + total for pagination. 403/404 (not a member) returns an empty list instead of throwing.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        groupId: { type: 'string', description: 'VRChat group id (grp_...)' },
+        n: { type: 'number', description: 'Page size (VRChat default applies when omitted)' },
+        offset: { type: 'number', description: 'Pagination offset' },
+        publicOnly: { type: 'boolean', description: 'When true, only publicly visible posts (no query param when omitted)' },
+      },
+      required: ['groupId'],
+    },
+    handler: async (args) => handleGetGroupPosts(args),
+  });
+
+  api.registerTool({
+    name: 'create_group_post',
+    description: '[group] ADD a post to a group\'s feed (POST /groups/{groupId}/posts) - existing posts are kept, unlike set_group_announcement which replaces the single legacy slot. title + text required; visibility \'group\' (default) or \'public\'; sendNotification defaults false (does not ping members). Requires the group-announcement-manage permission and confirm: true. Not destructive (reversible via delete_group_post).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        groupId: { type: 'string', description: 'VRChat group id (grp_...)' },
+        title: { type: 'string', description: 'Post title' },
+        text: { type: 'string', description: 'Post body text' },
+        visibility: { type: 'string', description: '\'group\' (default, members only) or \'public\'' },
+        sendNotification: { type: 'boolean', description: 'Notify group members (default false)' },
+        imageId: { type: 'string', description: 'Optional VRChat file id (file_...) to attach' },
+        roleIds: { type: 'array', description: 'Optional role ids (grol_...) this post is targeted at' },
+        confirm: { type: 'boolean', description: 'Must be true to actually publish; otherwise returns a preview only' },
+      },
+      required: ['groupId', 'title', 'text'],
+    },
+    destructive: false,
+    handler: async (args) => handleCreateGroupPost(args),
+  });
+
+  api.registerTool({
+    name: 'update_group_post',
+    description: '[group] EDIT one group post (PUT /groups/{groupId}/posts/{postId}). Pass postId (from get_group_posts) plus at least one of title / text / visibility. Requires the group-announcement-manage permission and confirm: true.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        groupId: { type: 'string', description: 'VRChat group id (grp_...)' },
+        postId: { type: 'string', description: 'Post / notification id (not_...)' },
+        title: { type: 'string', description: 'New title (omit to keep)' },
+        text: { type: 'string', description: 'New body text (omit to keep)' },
+        visibility: { type: 'string', description: '\'group\' or \'public\' (omit to keep)' },
+        confirm: { type: 'boolean', description: 'Must be true to actually save; otherwise returns a preview only' },
+      },
+      required: ['groupId', 'postId'],
+    },
+    destructive: false,
+    handler: async (args) => handleUpdateGroupPost(args),
+  });
+
+  api.registerTool({
+    name: 'delete_group_post',
+    description: '[group] DELETE one group post (DELETE /groups/{groupId}/posts/{postId}). Requires the group-announcement-manage permission and confirm: true. The body may still be checked in the group audit log (eventType group.announcement carries title/text) if a local archive exists; this tool cannot restore the post.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        groupId: { type: 'string', description: 'VRChat group id (grp_...)' },
+        postId: { type: 'string', description: 'Post / notification id (not_...)' },
+        confirm: { type: 'boolean', description: 'Must be true to actually delete; otherwise returns a preview only' },
+      },
+      required: ['groupId', 'postId'],
+    },
+    destructive: true,
+    handler: async (args) => handleDeleteGroupPost(args),
   });
 
   api.registerTool({
