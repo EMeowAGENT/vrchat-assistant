@@ -231,6 +231,11 @@ export default function register(api) {
     return vis;
   }
 
+  // 作者补名上限：resolveUserName 每次都打全局限流器（core/rate-limiter.js minInterval=2600ms），
+  // 逐作者串行 ⇒ 一页上百个不同作者会占满共享额度到分钟级（实测 5 作者 16.4s）。
+  // 超出上限的帖子 authorName 回 null，并留一行 INFO——本仓禁静默截断。
+  const MAX_POST_AUTHOR_LOOKUPS = 10;
+
   async function handleGetGroupPosts({ groupId, n, offset, publicOnly }) {
     if (!groupId) throw new Error('groupId is required');
     const q = [];
@@ -252,10 +257,16 @@ export default function register(api) {
       throw e;
     }
     const list = Array.isArray(data?.posts) ? data.posts : [];
-    // 作者名按**去重后的 authorId** 查：逐帖各查一次会在每页白吃十几条 API 配额
+    // 作者名按**去重后的 authorId** 查：逐帖各查一次会在每页白吃十几条 API 配额；
+    // 再按 MAX_POST_AUTHOR_LOOKUPS 截断（见上），避免一页上百作者串行占满全局限流器。
     const names = new Map();
-    for (const id of [...new Set(list.map((p) => p.authorId).filter(Boolean))]) {
+    const authorIds = [...new Set(list.map((p) => p.authorId).filter(Boolean))];
+    const toResolve = authorIds.slice(0, MAX_POST_AUTHOR_LOOKUPS);
+    for (const id of toResolve) {
       names.set(id, await resolveUserName(id));
+    }
+    if (authorIds.length > toResolve.length) {
+      api.log(`[group] get_group_posts ${groupId}: 作者补名截断 ${toResolve.length}/${authorIds.length}（限流保护，其余 authorName=null；本仓禁静默截断）`);
     }
     const posts = list.map((p) => ({
       id: p.id,
@@ -288,7 +299,8 @@ export default function register(api) {
     if (denied) return { ...denied, posted: false };
     const body = { title, text, visibility: vis, sendNotification: sendNotification === true };
     if (imageId) body.imageId = imageId;
-    if (roleIds) body.roleIds = roleIds;
+    // 空数组语义 = 不定向（与不传等价），不要把它写进 body
+    if (roleIds && (!Array.isArray(roleIds) || roleIds.length > 0)) body.roleIds = roleIds;
     let p;
     try {
       p = await api.vrchat.fetch(`/groups/${groupId}/posts`, { method: 'POST', body });
@@ -332,7 +344,7 @@ export default function register(api) {
         groupId,
         postId,
         confirmRequired: true,
-        message: 'This EDITS an existing group post (the old body is overwritten). Pass confirm: true to save.',
+        message: 'This EDITS an existing group post in place - the old body is overwritten and cannot be restored from this tool. Pass confirm: true to save.',
       };
     }
     const denied = await checkAnnouncementPermission(groupId);
@@ -675,7 +687,7 @@ export default function register(api) {
 
   api.registerTool({
     name: 'get_group_posts',
-    description: '[group] List a group\'s post feed (the official multi-post endpoint - unlike the legacy single-slot announcement, posts accumulate). Returns id/title/text/visibility/author/createdAt/roleIds per post + total for pagination. 403/404 (not a member) returns an empty list instead of throwing.',
+    description: '[group] List a group\'s post feed (the official multi-post endpoint - unlike the legacy single-slot announcement, posts accumulate). Returns id/title/text/visibility/author/createdAt/roleIds per post + total for pagination. Author names are resolved for at most the first 10 distinct authors per call (rate-limiter guard); beyond that authorName is null and a truncation line is logged. 403/404 (not a member) returns an empty list instead of throwing.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -712,7 +724,7 @@ export default function register(api) {
 
   api.registerTool({
     name: 'update_group_post',
-    description: '[group] EDIT one group post (PUT /groups/{groupId}/posts/{postId}). Pass postId (from get_group_posts) plus at least one of title / text / visibility. Requires the group-announcement-manage permission and confirm: true.',
+    description: '[group] EDIT one group post IN PLACE (PUT /groups/{groupId}/posts/{postId}) - the previous title/text is overwritten and cannot be restored from this tool (posts keep no version history). Pass postId (from get_group_posts) plus at least one of title / text / visibility. Requires the group-announcement-manage permission and confirm: true. DESTRUCTIVE: blocked in safe mode.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -725,7 +737,7 @@ export default function register(api) {
       },
       required: ['groupId', 'postId'],
     },
-    destructive: false,
+    destructive: true,
     handler: async (args) => handleUpdateGroupPost(args),
   });
 

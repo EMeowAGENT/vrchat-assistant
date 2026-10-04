@@ -63,7 +63,8 @@ metadata:
 
 - `create_group_post {groupId, title, text, visibility?}` → `POST /groups/{groupId}/posts`（body 必填 `{title, text, visibility}`，`visibility` = `group`（默认）/ `public`）——**旧帖保留**
 - `get_group_posts {groupId, n?, offset?, publicOnly?}` → `GET /groups/{groupId}/posts`，返回 `{posts, total}`（分页用 `offset`）
-- `update_group_post` / `delete_group_post` → `PUT` / `DELETE /groups/{groupId}/posts/{postId}`，`postId` 取自 `get_group_posts`（形如 `not_...`）
+- `update_group_post` / `delete_group_post` → `PUT` / `DELETE /groups/{groupId}/posts/{postId}`，`postId` 取自 `get_group_posts`（形如 `not_...`）——⚠️ `update` 是**原地覆盖**（无版本、不可恢复），**不是**追加式，与 `set_group_announcement` 同口径属破坏性工具（安全模式被拦）；**要加历史只用 `create_group_post`**
+- 列表的**作者补名单次最多 10 个**（超出 `authorName: null` + 一行 INFO 日志）——这是全局限流器保护（2.6s/次、共享额度），不是「这页只有 10 个作者」
 - `GET /groups/{groupId}/announcement` 返回的是**最新一条 post**（实测）——所以 `get_group_announcement` 看得到 `create_group_post` 发的内容，但它只是时间线的顶端快照，**要历史必须用 `get_group_posts`**
 - **权限位**：实测群 roles 与 `/groups/roleTemplates` 里**不存在任何 "post" 权限**，只有 `group-announcement-manage`——发帖沿用同一个权限自查，缺权限直接返回 `permitted:false` 不发请求
 - `sendNotification` 缺省 `false`：追加帖子默认不打扰成员，要全员推送才显式给 `true`

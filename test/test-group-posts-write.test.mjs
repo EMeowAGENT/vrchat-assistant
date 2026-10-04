@@ -15,7 +15,9 @@
  *   5. 400 → 服务端原因带进错误文案；非 400 原样抛（不被改写）
  *   6. update PUT / delete DELETE 到 /posts/{postId}（delete 不带 body）
  *   7. get 的返回结构、403/404 空态不抛、query 参数只在有值时出现
- *   8. 工具定义：delete_group_post destructive:true，create/update 不为 true
+ *   8. 工具定义：delete/update_group_post destructive:true，create/get 不为 true
+ *   9. 作者补名上限 10（超出 authorName=null 且留 INFO 日志）；roleIds 空数组不进 body；
+ *      安全模式（filterTools）剔除 update/delete、保留 create/get
  *
  * 用法：node --test test-group-posts-write.test.mjs
  */
@@ -51,6 +53,7 @@ function makeApi({
 } = {}) {
   const tools = new Map();
   const calls = [];
+  const logs = [];
   const api = {
     vrchat: {
       async fetch(p, opts = {}) {
@@ -69,13 +72,14 @@ function makeApi({
       },
     },
     registerTool(def) { tools.set(def.name, def); },
+    log(message) { logs.push(String(message)); },
     consume() { throw new Error('unexpected api.consume call'); },
   };
-  return { api, tools, calls };
+  return { api, tools, calls, logs };
 }
 
 async function setup(opts) {
-  const { api, tools, calls } = makeApi(opts);
+  const { api, tools, calls, logs } = makeApi(opts);
   const register = (await import(
     pathToFileURL(path.join(REPO, 'plugins', 'official', 'groups', 'index.js')).href
   )).default;
@@ -88,7 +92,7 @@ async function setup(opts) {
     ['update_group_post', update], ['delete_group_post', del]]) {
     assert.ok(def, `${name} should be registered`);
   }
-  return { get, create, update, del, calls, tools };
+  return { get, create, update, del, calls, tools, logs };
 }
 
 const writes = (calls) => calls.filter((c) => c.opts && ['POST', 'PUT', 'DELETE'].includes(c.opts.method));
@@ -363,11 +367,11 @@ test('get: 作者名按去重后的 authorId 查（每页不重复烧配额）',
 
 // ───────────────────── 工具定义 ─────────────────────
 
-test('工具定义：delete_group_post 带 destructive:true，create/update 不为 true', async () => {
+test('工具定义：delete/update_group_post 带 destructive:true，create/get 不为 true', async () => {
   const { get, create, update, del } = await setup({});
   assert.equal(del.destructive, true, 'delete_ 前缀工具不声明 destructive 会被 loader 拒绝加载');
+  assert.equal(update.destructive, true, 'update 是 PUT 原地覆盖正文（无版本、不可恢复），与 set_group_announcement 同口径属破坏性');
   assert.notEqual(create.destructive, true, 'create_group_post 是追加式、可由 delete_group_post 撤销，不该被安全模式误拦');
-  assert.notEqual(update.destructive, true);
   assert.notEqual(get.destructive, true);
 
   assert.deepEqual(create.inputSchema.required, ['groupId', 'title', 'text']);
@@ -395,4 +399,56 @@ test('set_group_announcement 描述里指向追加式 posts 接口（行为不�
   assert.match(set.description, /Legacy single-slot endpoint/);
   assert.match(set.description, /use create_group_post/);
   assert.equal(set.destructive, true, 'legacy 单槽仍是破坏性工具');
+});
+
+// ───────────────────── 限流保护 / 安全模式口径 ─────────────────────
+
+test('get: 作者补名上限 10 个（超出 authorName=null 且留一行 INFO）', async () => {
+  const postsResult = {
+    total: 12,
+    posts: Array.from({ length: 12 }, (_, i) => ({ id: `not_${i}`, title: `t${i}`, authorId: `usr_${i}` })),
+  };
+  const { get, calls, logs } = await setup({ postsResult });
+  const r = await get.handler({ groupId: GROUP_ID });
+  const userCalls = calls.filter((c) => c.path.startsWith('/users/'));
+  assert.equal(userCalls.length, 10, '补名请求不应超过上限 10（全局限流器共享额度保护）');
+  assert.equal(r.count, 12, '截断只影响补名，不影响帖子本身');
+  assert.equal(r.posts[0].authorName, '测试作者');
+  assert.equal(r.posts[11].authorName, null, '超出上限的作者名应为 null');
+  assert.equal(logs.length, 1, '截断必须留一行日志（本仓禁静默截断）');
+  assert.match(logs[0], /作者补名截断 10\/12/);
+});
+
+test('get: 作者数不超上限时不截断、不记日志', async () => {
+  const postsResult = { total: 2, posts: [{ id: 'not_a', authorId: 'usr_a' }, { id: 'not_b', authorId: 'usr_b' }] };
+  const { get, logs } = await setup({ postsResult });
+  const r = await get.handler({ groupId: GROUP_ID });
+  assert.equal(r.posts[1].authorName, '测试作者');
+  assert.equal(logs.length, 0);
+});
+
+test('create: roleIds 空数组不进 body（非空数组照常透传）', async () => {
+  const empty = await setup({});
+  await empty.create.handler({ groupId: GROUP_ID, title: 'T', text: 'B', roleIds: [], confirm: true });
+  const b1 = empty.calls.find((c) => c.opts && c.opts.method === 'POST').opts.body;
+  assert.equal(Object.prototype.hasOwnProperty.call(b1, 'roleIds'), false, '空数组语义=不定向，不应写进 body');
+
+  const filled = await setup({});
+  await filled.create.handler({ groupId: GROUP_ID, title: 'T', text: 'B', roleIds: ['grol_x'], confirm: true });
+  const b2 = filled.calls.find((c) => c.opts && c.opts.method === 'POST').opts.body;
+  assert.deepEqual(b2.roleIds, ['grol_x']);
+});
+
+test('安全模式：filterTools 剔除 update/delete_group_post，保留 create/get', async () => {
+  const { get, create, update, del } = await setup({});
+  const { filterTools } = await import(pathToFileURL(path.join(REPO, 'core', 'safe-mode.js')).href);
+  const prev = process.env.VRC_MONITOR_SAFE_MODE;
+  process.env.VRC_MONITOR_SAFE_MODE = 'true';
+  try {
+    const visible = filterTools([get, create, update, del]).map((t) => t.name).sort();
+    assert.deepEqual(visible, ['create_group_post', 'get_group_posts']);
+  } finally {
+    if (prev === undefined) delete process.env.VRC_MONITOR_SAFE_MODE;
+    else process.env.VRC_MONITOR_SAFE_MODE = prev;
+  }
 });
