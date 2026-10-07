@@ -5,6 +5,7 @@
 import { ctx, log, parseLocation } from '../server-context.js';
 import { resolveWorldNames } from '../world-names.js';
 import { isOnlineForCount, readOnlineCountIncludeWeb } from '../online-count-policy.js';
+import { fetchProfileBio } from '../profile-bio.js';   // 简介(bio)已移出 user 对象（2026-10-07）
 
 export async function handleGetOnlineFriends() {
   const { storage, api } = ctx;
@@ -106,10 +107,13 @@ export async function handleGetFriendInfo({ userId, displayName }) {
   const r = await api._request('GET', `/users/${targetId}`);
   if (r.status !== 200) throw new Error(`API error: ${r.status}`);
   const u = r.data;
+  // 简介真值单独取：新版资料系统已把 bio 移出 user 对象 ⇒ 直接读 u.bio 会让该键整条消失 ✗（2026-10-07）
+  const bioText = await fetchProfileBio(api, u.id);
   return {
     userId: u.id,
     displayName: u.displayName,
-    bio: u.bio,
+    // null = 未知（取不到），'' = 确实没写简介 —— 保留这个区分（评审 💡）
+    bio: bioText === undefined ? null : bioText,
     status: u.status,
     statusDescription: u.statusDescription,
     state: u.state,
@@ -145,6 +149,8 @@ export async function handleSearchUsers({ query, limit = 10 }) {
     .map(u => ({
       userId: u.id,
       displayName: u.displayName,
+      // ⚠️ 已知未覆盖（2026-10-07 评审 💡，main 既有）：搜索结果预览仍读 u.bio（已不在 user 对象里）⇒
+      // 该预览恒空；逐结果补 /profile 会造成 N 次请求，故不纳入，仅登记。
       bio: (u.bio || '').slice(0, 100),
       status: u.status,
       isFriend: u.isFriend,
