@@ -419,6 +419,11 @@ function checkRotation(line) {
 // ② 同一「连续失败段」内错误只输出一次，不逐行刷屏；
 // ③ 连续失败达 FILE_WRITE_DEGRADE_AFTER 次 → 按启动期同语义降级为仅 console
 //    （fileEnabled=false + filePath=''），使 /health.logging 继续报生效值。
+//    ⚠️ 显式取舍（降级是「本进程生命周期内单向」的，需重启恢复）：ENOENT/ENOTDIR 走 ①
+//    自愈、不进入降级；但 ENOSPC/EPERM/EBUSY/EMFILE/EACCES 这类「原因可能自行消失」的
+//    瞬时失败，连续 3 次同样会降级且此后本进程不再重试写文件——即把一次瞬时抖动放大为
+//    「重启才恢复」。此处优先保证「失败不逐行刷屏 + /health 不说谎」，与 doRotate() 对
+//    EPERM/EBUSY「跳过本次轮转」的既有取舍取向一致；不引入后台定时重试以保持 logger 无副作用。
 const FILE_WRITE_DEGRADE_AFTER = 3;
 
 function appendFileLine(fileLine) {
@@ -428,16 +433,19 @@ function appendFileLine(fileLine) {
 
 function markFileWriteFailure(err) {
   state.fileWriteFailures += 1;
-  if (!state.console) return;
-  if (state.fileWriteFailures === 1) {
+  // console 通道可能被 VRC_MONITOR_LOGGER_CONSOLE=0 关闭：提示文案随之静默，但**状态迁移
+  // 不受影响**（降级必须照样发生，否则该配置下 /health.logging 会退回「零落盘却报 file:true」）。
+  if (state.fileWriteFailures === 1 && state.console) {
     console.error(`[logger] 写入日志文件失败: ${err.message}`);
   }
   if (state.fileWriteFailures >= FILE_WRITE_DEGRADE_AFTER) {
     state.fileEnabled = false;
     state.filePath = '';
-    console.error(
-      `[logger] 日志文件连续 ${state.fileWriteFailures} 次写入失败，已降级为仅 console（不再落盘，重启后重新尝试）: ${err.message}`
-    );
+    if (state.console) {
+      console.error(
+        `[logger] 日志文件连续 ${state.fileWriteFailures} 次写入失败，已降级为仅 console（不再落盘，重启后重新尝试）: ${err.message}`
+      );
+    }
   }
 }
 

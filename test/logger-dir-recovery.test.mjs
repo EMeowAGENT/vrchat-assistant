@@ -7,6 +7,9 @@
  *   2. 连续失败未达阈值即恢复 → 不得降级（避免瞬时抖动清空文件日志）；
  *   3. 不可自愈的连续失败 → 同一失败段只输出一次错误（不逐行刷屏），达阈值后
  *      按启动期同语义降级为仅 console（file=false + filePath=''），stdout 仍保留。
+ *   4. console:false（VRC_MONITOR_LOGGER_CONSOLE=0）下上述降级仍必须发生、且
+ *      getLoggerInfo() 如实报 file:false——提示文案随 console 关闭静默，但状态迁移
+ *      不得被 early return 挡掉（否则该配置下 /health.logging 退回「零落盘却报 true」）。
  *
  * 自包含：显式临时目录 + 显式 initLogger 选项；**不触碰 <仓库>/logs**
  * （那是默认配置下正在写生产日志的目录，删它会误删线上日志）。
@@ -129,4 +132,22 @@ test('不可自愈的连续失败 → 错误去重 + 达阈值降级为仅 conso
   log.info('降级后一行');
   assert.equal(captured.length, before + 1, 'stdout 必须始终保留（开发规范 §3.8）');
   assert.equal(countCaptured('写入日志文件失败'), 1, '降级后不得再报写入失败');
+});
+
+test('console:false 下不可自愈失败仍须降级并如实报 file:false（提示静默但状态迁移不受影响）', () => {
+  const dir = path.join(rundir, 'noconsole');
+  initLogger({ dir, level: 'info', format: 'text', console: false, file: true, syslogPrefix: false });
+  const log = getLogger('t');
+
+  log.info('正常一行');
+  replaceDirWithFile(dir);
+  log.info('失败一');
+  log.info('失败二');
+  log.info('失败三'); // 第 3 次连续失败 → 达阈值降级（console 关闭不得挡住降级）
+
+  const info = getLoggerInfo();
+  assert.equal(info.file, false, 'console:false 下亦须降级并报生效值 false（原缺陷：early return 把降级块一并挡掉）');
+  assert.equal(info.filePath, '', '降级后 filePath 应为空串（与 file:false 自洽）');
+  assert.equal(countCaptured('写入日志文件失败'), 0, 'console 关闭时错误提示应静默（无 stdout 通道）');
+  assert.equal(countCaptured('已降级为仅 console'), 0, 'console 关闭时降级提示应静默');
 });
